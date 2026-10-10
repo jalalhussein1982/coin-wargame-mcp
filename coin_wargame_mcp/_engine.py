@@ -22,8 +22,10 @@ if not (VENDOR_ROOT / "src").is_dir():  # pragma: no cover - environment problem
         f"Engine submodule missing at {VENDOR_ROOT}. Run: git submodule update --init"
     )
 
+# Appended, not prepended: the engine's top-level `src` package collides with nothing, and
+# appending keeps the engine's own `tests/` package from shadowing this repo's `tests/`.
 if str(VENDOR_ROOT) not in sys.path:
-    sys.path.insert(0, str(VENDOR_ROOT))
+    sys.path.append(str(VENDOR_ROOT))
 
 # The server never talks to an LLM. The engine's ICOracle, PostTurnAnalyzer,
 # AARGenerator and StrategyClassifier read this variable at construction time and

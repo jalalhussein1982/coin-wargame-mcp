@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Read-only QA pairs over one fixed game: seed 7, the ten-turn script in tests/scripted.py
+  (government: patrol, tribal_engagement, intelligence_operation, patrol, media_campaign,
+  checkpoint_network, patrol, tribal_engagement, patrol, media_campaign; insurgent: smuggling,
+  propaganda, taxation, hit_and_run, propaganda, smuggling, taxation, propaganda, taxation,
+  intimidation; one military_aid IC request on turn 3), then end_game.
+
+  Every answer is asserted against a live replay of that game by tests/test_evals.py, so the
+  pairs stay true to the engine. `tool` is the call that answers the question; `check` is the
+  JSON path (dot notation, `[i]` for lists) whose value must equal `expected`.
+-->
+<evaluation name="coin-wargame" server="coin-wargame-mcp" protocol="2026-07-28">
+  <setup>
+    <step>new_game(seed=7)</step>
+    <step>play tests/scripted.py for 10 turns (20 actions, 1 IC request)</step>
+    <step>end_game(game_id)</step>
+  </setup>
+
+  <qa id="1">
+    <question>What did the government's first move roll, against what threshold, and what was the outcome?</question>
+    <answer>The turn-1 patrol in Hodh Ech Chargui rolled 42 against a required 15: a critical failure.</answer>
+    <tool>read_resource wargame://game/{game_id}/log</tool>
+    <check path="log[0].adjudication.success_roll" expected="42"/>
+    <check path="log[0].adjudication.required_roll" expected="15"/>
+    <check path="log[0].adjudication.outcome" expected="critical_failure"/>
+  </qa>
+
+  <qa id="2">
+    <question>How did the international community answer the turn-3 request for military aid?</question>
+    <answer>Conditional.</answer>
+    <tool>read_resource wargame://game/{game_id}/log</tool>
+    <check path="log[4].kind" expected="ic_request"/>
+    <check path="log[4].ic.request_type" expected="military_aid"/>
+    <check path="log[4].ic.decision" expected="conditional"/>
+  </qa>
+
+  <qa id="3">
+    <question>Does the game replay exactly from its seed, and how many logged entries were re-run?</question>
+    <answer>Yes: reproduced is true, 21 entries (20 actions and 1 IC request), final turn 11.</answer>
+    <tool>replay</tool>
+    <check path="reproduced" expected="true"/>
+    <check path="actions" expected="21"/>
+    <check path="final_turn" expected="11"/>
+  </qa>
+
+  <qa id="4">
+    <question>Who won, and what turn did the game end on?</question>
+    <answer>Nobody; the game was ended by end_game after turn 10 with the counter at 11, a stalemate.</answer>
+    <tool>end_game</tool>
+    <check path="total_turns" expected="11"/>
+    <check path="victory" expected="null"/>
+    <check path="actions_logged" expected="20"/>
+  </qa>
+
+  <qa id="5">
+    <question>How many provinces were contested at the end, and which?</question>
+    <answer>Three: Hodh Ech Chargui, Hodh El Gharbi and Guidimaka. Ten were government-controlled, none insurgent.</answer>
+    <tool>end_game; get_state</tool>
+    <check path="final_state.contested_provinces" expected="3"/>
+    <check path="final_state.government_provinces" expected="10"/>
+    <check path="final_state.insurgent_provinces" expected="0"/>
+  </qa>
+
+  <qa id="6">
+    <question>What were both sides' resources and the government's legitimacy at the end?</question>
+    <answer>Government 104, insurgent 75, legitimacy 70.</answer>
+    <tool>get_state</tool>
+    <check path="global_state.government_resources" expected="104"/>
+    <check path="global_state.insurgent_resources" expected="75"/>
+    <check path="global_state.government_legitimacy" expected="70"/>
+  </qa>
+
+  <qa id="7">
+    <question>What COIN approach does the strategy classifier assign to the government, with what confidence, and how many government actions did it see?</question>
+    <answer>population_centric, confidence 0.9, ten government actions.</answer>
+    <tool>strategy_profile</tool>
+    <check path="approach" expected="population_centric"/>
+    <check path="confidence" expected="0.9"/>
+    <check path="government_actions_seen" expected="10"/>
+  </qa>
+
+  <qa id="8">
+    <question>What is the government's favourite action and risk profile according to the pattern detector?</question>
+    <answer>patrol; risk_averse, predictability 0.21.</answer>
+    <tool>pattern_report</tool>
+    <check path="favorite_actions[0]" expected="patrol"/>
+    <check path="risk_profile" expected="risk_averse"/>
+    <check path="predictability_score" expected="0.21"/>
+  </qa>
+
+  <qa id="9">
+    <question>What outcome and performance score does the after-action review give?</question>
+    <answer>Stalemate, performance_score 100.0 (the engine's formula credits territory, legitimacy and force preservation).</answer>
+    <tool>after_action_review</tool>
+    <check path="outcome" expected="stalemate"/>
+    <check path="performance_score" expected="100.0"/>
+  </qa>
+
+  <qa id="10">
+    <question>What were the true insurgent and government force totals at the end, and what estimate did the government hold?</question>
+    <answer>Insurgent 3458, government 25636; the government's estimate stayed at 2500.</answer>
+    <tool>get_state(view=full)</tool>
+    <check path="global_state.faction_forces.insurgent_total" expected="3458"/>
+    <check path="global_state.faction_forces.government_total" expected="25636"/>
+    <check path="global_state.faction_forces.insurgent_estimated_by_government" expected="2500"/>
+  </qa>
+</evaluation>
