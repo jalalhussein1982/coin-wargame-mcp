@@ -134,6 +134,7 @@ def build_server(token_verifier=None, auth=None) -> MCPServer:
             "resources/read": CacheHint(ttl_ms=0, scope="private"),
         },
         middleware=[_resource_cache_hints],
+        log_level="WARNING",  # the engine logs every resolution at INFO; keep stderr readable
     )
 
 

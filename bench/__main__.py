@@ -182,7 +182,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args(argv)
     label = args.model if "anthropic" in (args.red, args.gov) else "stub"
-    out = args.out or RESULTS_DIR / f"{datetime.now(UTC):%Y-%m-%d}-{label}.jsonl"
+    out = args.out or RESULTS_DIR / f"{datetime.now():%Y-%m-%d}-{label}.jsonl"
     seeds = list(range(args.seed, args.seed + args.games))
     asyncio.run(run(stdio_server(), seeds, args.red, args.gov, args.model, args.max_turns, args.side, out, args.verbose))
     print(summarize(out))

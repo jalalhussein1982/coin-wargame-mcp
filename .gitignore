@@ -11,4 +11,4 @@ dist/
 games.db
 *.db
 .hypothesis/
-bench/results/*.jsonl
+bench/results/bench-games.db*
