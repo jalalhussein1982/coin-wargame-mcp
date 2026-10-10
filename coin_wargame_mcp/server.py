@@ -94,13 +94,22 @@ PUBLIC_RESOURCE_PREFIXES = ("wargame://doctrine/", "wargame://rules/")
 
 async def _resource_cache_hints(ctx, call_next):
     """Per-URI freshness: rules and doctrine are public and stable (1 h); game rows are
-    private and never fresh (0 ms). The server-wide ``cache_hints`` cover the lists."""
+    private and never fresh (0 ms). The server-wide ``cache_hints`` cover the lists.
+
+    The lowlevel server hands middleware the handler result as a wire-shaped dict
+    (``ttlMs``/``cacheScope``) once the server-wide hint has been applied, so this
+    overrides those two keys; a model result is handled the same way for safety."""
     result = await call_next(ctx)
-    if ctx.method == "resources/read" and result is not None and hasattr(result, "model_copy"):
-        uri = str((ctx.params or {}).get("uri", ""))
-        if uri.startswith(PUBLIC_RESOURCE_PREFIXES):
-            return result.model_copy(update={"ttl_ms": HOUR_MS, "cache_scope": "public"})
-        return result.model_copy(update={"ttl_ms": 0, "cache_scope": "private"})
+    if ctx.method != "resources/read" or result is None:
+        return result
+    uri = str((ctx.params or {}).get("uri", ""))
+    public = uri.startswith(PUBLIC_RESOURCE_PREFIXES)
+    ttl, scope = (HOUR_MS, "public") if public else (0, "private")
+    if isinstance(result, dict):
+        result["ttlMs"], result["cacheScope"] = ttl, scope
+        return result
+    if hasattr(result, "model_copy"):
+        return result.model_copy(update={"ttl_ms": ttl, "cache_scope": scope})
     return result
 
 
