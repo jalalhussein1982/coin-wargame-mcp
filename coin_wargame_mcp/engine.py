@@ -306,16 +306,15 @@ class Engine:
         oracle._model = None
         req = E.ICRequest(request_type=request_type, requesting_faction="government",
                           justification=justification, target=target)
-        seeded = random.Random(self.dice.roll(10**6))
-        module = E.ICOracle.__module__
-        import importlib
-        mod = importlib.import_module(module)
-        saved = mod.random
+        # `_fallback_evaluate` does `import random` inside the method and calls the module-level
+        # `random.random()`. Seed that global generator from the game dice for the duration of the
+        # call and restore its prior state afterwards, so nothing else in the process is affected.
+        saved = random.getstate()
+        random.seed(self.dice.roll(10**6))
         try:
-            mod.random = seeded  # the oracle does `import random` inside the method; shadow it
             resp = oracle._fallback_evaluate(req, self.gs)
         finally:
-            mod.random = saved
+            random.setstate(saved)
         out = {
             "decision": resp.decision, "conditions": list(resp.conditions), "magnitude": resp.magnitude,
             "timeline": resp.timeline, "backlash_effects": list(resp.backlash_effects),
