@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "coin-wargame": {
+      "command": "uv",
+      "args": ["run", "--directory", ".", "python", "-m", "coin_wargame_mcp.server"],
+      "env": {
+        "COIN_WARGAME_DB": "games.db"
+      }
+    }
+  }
+}

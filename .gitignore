@@ -6,3 +6,9 @@ __pycache__/
 *.db-journal
 dist/
 .DS_Store
+
+# server data
+games.db
+*.db
+.hypothesis/
+bench/results/*.jsonl

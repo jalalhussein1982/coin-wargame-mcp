@@ -1,0 +1,3 @@
+[submodule "vendor/mauritania-coin-wargame"]
+	path = vendor/mauritania-coin-wargame
+	url = https://github.com/jalalhussein1982/mauritania-coin-wargame
