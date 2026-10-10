@@ -61,10 +61,16 @@ class SubmitResult:
 
 
 def make_action(faction: str, data: dict) -> E.Action:
-    """Build the engine's faction-specific action model from a plain dict."""
+    """Build the engine's faction-specific action model from a plain dict.
+
+    Accepts a ``LegalAction`` dict as-is: when ``forces_committed`` is absent, the
+    ``min_forces`` it carries is used, so every row of ``list_legal_actions`` is
+    submittable without edits."""
     cls = E.GovernmentAction if faction == "government" else E.InsurgentAction
     payload = {k: v for k, v in data.items() if k in {
         "action_type", "source_province", "target_province", "forces_committed", "resources_spent"}}
+    if "forces_committed" not in payload and "min_forces" in data:
+        payload["forces_committed"] = data["min_forces"]
     return cls(**payload)
 
 
