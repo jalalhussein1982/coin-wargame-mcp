@@ -16,14 +16,15 @@ async def test_stub_vs_stub_three_seeds(tmp_path):
     from coin_wargame_mcp.server import mcp
 
     out = tmp_path / "bench.jsonl"
-    await run(mcp, [1, 2, 3], "stub", "stub", "unused", max_turns=6, side="red", out=out)
+    await run(mcp, [1, 2, 3], "stub", "stub", "unused", max_turns=12, side="red", out=out)
     rows = [json.loads(l) for l in out.read_text().splitlines()]
     assert [r["seed"] for r in rows] == [1, 2, 3]
     for r in rows:
         assert r["illegal_attempts"] == 0
         assert r["reproduced"] is True
         assert r["stalls"] == 0
-        assert r["turns"] >= 6 or r["winner"] is not None
+        assert r["turns"] >= 12 or r["winner"] is not None
+        assert r["tool_calls"] <= 3 * 12  # recommend + list + act per turn, never a retry loop
         assert r["performance_score"] is not None and r["approach"]
         assert r["model"] == "stub" and r["side"] == "insurgent" and r["opponent"] == "stub"
     table = summarize(out)

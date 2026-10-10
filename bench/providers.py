@@ -71,8 +71,11 @@ class StubProvider:
         faction = state["faction"]
         if faction == "insurgent" and not state.get("doctrine_asked"):
             return ToolCall("recommend_doctrine", {"game_id": state["game_id"]})
-        if not state.get("legal"):
+        if "legal" not in state:
             return ToolCall("list_legal_actions", {"game_id": state["game_id"], "faction": faction, "limit": 500})
+        if not state["legal"]:
+            # Nothing is affordable (the insurgent runs dry after a few turns of spending): pass.
+            return ToolCall("pass_turn", {"game_id": state["game_id"], "faction": faction})
         prefs = PREFERRED["government"] if faction == "government" else PREFERRED.get(state.get("doctrine") or "AQ_NETWORK")
         legal = state["legal"]
         chosen = None
