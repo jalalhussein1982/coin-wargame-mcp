@@ -30,9 +30,11 @@ async def test_government_view_hides_true_insurgent_numbers(client: Client, game
         assert "insurgent_estimated" in p
     assert gov["global_state"]["insurgent_resources"] is None
     assert gov["global_state"]["faction_forces"]["insurgent_total"] is None
-    assert gov["global_state"]["faction_forces"]["insurgent_estimated_by_government"] == 2500
-    # The estimate is apportioned from the government's 2500, not the true 3500.
-    assert sum(p["insurgent_estimated"] for p in gov["provinces"]) in range(2490, 2511)
+    # The estimate is the server's lagged, noisy model (seeded, see engine.py), not the true 3500
+    # and not the true share of the engine's frozen 2500.
+    est_total = sum(p["insurgent_estimated"] for p in gov["provinces"])
+    assert gov["global_state"]["faction_forces"]["insurgent_estimated_by_government"] == est_total
+    assert 1800 <= est_total <= 3200 and est_total != 3500
 
     ins = (await client.call_tool("get_state", {"game_id": game, "view": "insurgent"})).structured_content
     by_id = {p["id"]: p for p in ins["provinces"]}
@@ -66,8 +68,10 @@ async def test_briefs_for_both_seats(client: Client, game: str):
     for section in ("## FORCE SUMMARY", "## TERRITORIAL CONTROL", "## MALI BORDER CORRIDOR", "## POPULATION SENTIMENT",
                     "## RESOURCE STATUS", "## SCENARIO CONDITIONS", "## INSURGENT PATTERNS", "## STRATEGIC OPPORTUNITIES"):
         assert section in gov["markdown"], section
-    # The true counts (1200 in Hodh Ech Chargui, 800 in Hodh El Gharbi) never reach the government.
-    assert "ins=1200" not in gov["markdown"] and "Ins=1200" not in gov["markdown"]
+    # The true counts (1200 in Hodh Ech Chargui, 800 in Hodh El Gharbi) never reach the government,
+    # and neither does the true share of the engine's 2500 (857 / 571), which was the earlier leak.
+    for leak in ("ins=1200", "Ins=1200", "ins=800", "Ins=800", "~857", "~571"):
+        assert leak not in gov["markdown"], leak
     assert "ins~" in gov["markdown"] and "Ins~" in gov["markdown"]
     assert gov["recommended_doctrine"] is None
 

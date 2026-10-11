@@ -79,7 +79,7 @@ class VictoryView(BaseModel):
 
 class GameStateView(BaseModel):
     game_id: str
-    seed: int
+    seed: int | None = Field(default=None, description="Dice seed. Null unless the caller may see it (both seats held, or game ended) and the view is full.")
     version: int = Field(description="Row version; a write that races another write fails and asks you to re-read.")
     status: Literal["active", "ended"]
     turn: int
@@ -101,7 +101,7 @@ class SeatTokens(BaseModel):
 
 class GameCreated(BaseModel):
     game_id: str = Field(description="Handle for every other tool. The server keeps nothing else about you.")
-    seed: int
+    seed: int | None = Field(description="The dice seed. Null when a seat is open: a seed predicts rolls for both sides.")
     seats: dict[str, SeatMode]
     seat_tokens: SeatTokens = Field(description="Only seats marked 'open' get a token; give it to the other host.")
     initial_state: GameStateView
@@ -109,7 +109,7 @@ class GameCreated(BaseModel):
 
 class GameCard(BaseModel):
     game_id: str
-    seed: int
+    seed: int | None = None
     turn: int
     phase: str
     active_faction: Faction
@@ -131,7 +131,7 @@ class GameSummary(BaseModel):
 
 class Replay(BaseModel):
     game_id: str
-    seed: int
+    seed: int | None = Field(default=None, description="Null while a seat is open and the game is active.")
     actions: int = Field(description="Turn-log entries re-run (actions, passes, IC requests).")
     reproduced: bool = Field(description="True when re-running the log from the seed rebuilt the stored state exactly.")
     divergence_at_turn: int | None = None
@@ -142,9 +142,10 @@ class Replay(BaseModel):
 
 
 class ProvinceDetail(BaseModel):
-    province: ProvinceView
-    text: str = Field(description="The engine's own province encoding (state_encoder.encode_province_details).")
-    legal_action_count: dict[str, int] = Field(description="Legal actions from this province per faction.")
+    view: View
+    province: ProvinceView | FoggedProvinceView
+    text: str = Field(description="The engine's own province encoding; in the government view the insurgent line is the estimate (~).")
+    legal_action_count: dict[str, int] = Field(description="Legal actions from this province per faction the caller may see.")
 
 
 class Brief(BaseModel):

@@ -19,6 +19,7 @@ paths are wrapped because they are not seeded upstream:
 from __future__ import annotations
 
 import random
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -35,6 +36,19 @@ ADJACENCY_TYPES = {
     E.ActionType.HIT_AND_RUN,
 }
 IC_REQUEST_TYPES = ("military_aid", "sanctions", "diplomatic_pressure", "humanitarian", "peacekeeping")
+
+# Government intelligence estimate (server-side; the engine's own figure is a frozen constant).
+ESTIMATE_LAG = 0.7          # weight of the previous estimate when a new report comes in
+ESTIMATE_NOISE = (0.75, 1.25)  # multiplicative noise band on each fresh report
+INITIAL_UNDERCOUNT = 2500 / 3500  # the scenario's 2500 estimate against 3500 true fighters
+
+
+def _estimate_noise(seed: int, turn: int, province_id: str) -> float:
+    """Deterministic per (seed, turn, province) noise; independent of the game dice so the
+    estimate does not disturb the adjudication roll sequence."""
+    r = random.Random(f"{seed}:{turn}:{province_id}").random()
+    lo, hi = ESTIMATE_NOISE
+    return lo + (hi - lo) * r
 
 
 class IllegalAction(ValueError):
@@ -96,8 +110,14 @@ class Engine:
             raise ValueError(f"unknown scenario {scenario!r}; only 'mauritania_default' exists")
         gs = E.GameStateStore()
         gs.load_initial_state(E.INITIAL_STATE_PATH)
-        controller = {"phase": "government_action", "session_state": "active", "actions_this_turn": []}
-        return cls(gs, controller, E.DiceRoller(seed), seed)
+        controller = {"phase": "government_action", "session_state": "active", "actions_this_turn": [],
+                      "estimates": {}}
+        eng = cls(gs, controller, E.DiceRoller(seed), seed)
+        eng.controller["estimates"] = {
+            p.id: round(p.insurgent_forces * INITIAL_UNDERCOUNT * _estimate_noise(seed, 0, p.id))
+            for p in gs.get_all_provinces()
+        }
+        return eng
 
     @classmethod
     def load(cls, rec: GameRecord) -> Engine:
@@ -108,8 +128,15 @@ class Engine:
             "phase": rec.controller.get("phase", "government_action"),
             "session_state": rec.controller.get("session_state", "active"),
             "actions_this_turn": list(rec.controller.get("actions_this_turn", [])),
+            "estimates": dict(rec.controller.get("estimates", {})),
         }
-        return cls(gs, controller, dice, rec.seed)
+        eng = cls(gs, controller, dice, rec.seed)
+        if not eng.controller["estimates"]:  # rows written before the estimate model existed
+            eng.controller["estimates"] = {
+                p.id: round(p.insurgent_forces * INITIAL_UNDERCOUNT * _estimate_noise(rec.seed, 0, p.id))
+                for p in gs.get_all_provinces()
+            }
+        return eng
 
     def snapshot(self) -> tuple[dict, dict, list]:
         return self.gs.serialize(), dict(self.controller), dice_state_to_json(self.dice._rng.getstate())
@@ -131,6 +158,34 @@ class Engine:
     @property
     def active_faction(self) -> str:
         return self.global_state.active_faction
+
+    @property
+    def estimates(self) -> dict[str, int]:
+        """The government's per-province estimate of insurgent strength (server-side fog model)."""
+        return dict(self.controller["estimates"])
+
+    def _update_estimates(self) -> None:
+        """A fresh, noisy intelligence report blended into the lagged estimate. Called once per
+        insurgent phase, so the government learns about the enemy a turn late and imprecisely."""
+        turn = self.turn
+        new = {}
+        for p in self.gs.get_all_provinces():
+            prev = self.controller["estimates"].get(p.id, 0)
+            report = p.insurgent_forces * _estimate_noise(self.seed, turn, p.id)
+            new[p.id] = max(0, round(ESTIMATE_LAG * prev + (1 - ESTIMATE_LAG) * report))
+        self.controller["estimates"] = new
+
+    def fogged_store(self) -> E.GameStateStore:
+        """A copy of the state with insurgent numbers replaced by the government's estimate.
+        Government previews and validation warnings run against this copy so the engine's
+        force-ratio text never carries the true count."""
+        data = self.gs.serialize()
+        est = self.controller["estimates"]
+        for prov in data["provinces"]:
+            prov["insurgent_forces"] = est.get(prov["id"], 0)
+        data["global_state"]["faction_forces"]["insurgent_total"] = sum(est.values())
+        data["global_state"]["faction_forces"]["insurgent_estimated_by_government"] = sum(est.values())
+        return E.GameStateStore.deserialize(data)
 
     def _session_controller(self) -> E.SessionController:
         """A SessionController bound to our state, for check_victory_conditions/end_session."""
@@ -177,11 +232,14 @@ class Engine:
                         })
         return out
 
-    def validate(self, faction: str, action: E.Action) -> E.ActionValidation:
-        return E.rules_engine.validate_action(action, self.gs)
+    def validate(self, faction: str, action: E.Action, *, fog: bool = False) -> E.ActionValidation:
+        """Validity is identical on the fogged copy for government actions (its checks read only
+        government forces, resources and control); only the warnings' force ratio differs."""
+        return E.rules_engine.validate_action(action, self.fogged_store() if fog else self.gs)
 
     def preview(self, faction: str, action: E.Action) -> dict:
-        return self._resolver.get_probability_breakdown(action, self.gs)
+        store = self.fogged_store() if faction == "government" else self.gs
+        return self._resolver.get_probability_breakdown(action, store)
 
     def recommend_doctrine(self) -> tuple[str, str]:
         d = E.doctrine_selector.select_doctrine(self.gs)
@@ -267,6 +325,8 @@ class Engine:
                         "success_roll": res.success_roll, "required_roll": res.required_roll}
         self._record({"faction": faction, "action": action_dump(action), "outcome": outcome_blob,
                       "rationale": rationale or ""})
+        if not is_gov:
+            self._update_estimates()
         self._advance_phase()
         self._advance_phase()
         self.gs.recalculate_force_totals()
@@ -285,6 +345,8 @@ class Engine:
         turn = self.turn
         self._record({"faction": faction, "action": None, "outcome": {"outcome": "passed", "mutations": []},
                       "rationale": ""})
+        if faction == "insurgent":
+            self._update_estimates()
         self._advance_phase()
         self._advance_phase()
         self.gs.recalculate_force_totals()

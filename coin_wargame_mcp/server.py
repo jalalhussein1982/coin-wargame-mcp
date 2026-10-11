@@ -31,6 +31,7 @@ Design choices, stated once here and once in the README:
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import logging
 import os
@@ -159,6 +160,48 @@ def _victory(v: dict | None) -> VictoryView | None:
     return VictoryView(**v) if v else None
 
 
+def _open(rec: GameRecord, faction: str) -> bool:
+    return rec.seats.get(faction, "host") == "open"
+
+
+def _holds(rec: GameRecord, faction: str, token: str | None) -> bool:
+    """A caller holds a seat when it is 'host' (the creating host plays it) or the token matches."""
+    if not _open(rec, faction):
+        return True
+    expected = rec.seat_tokens.get(faction)
+    return bool(token and expected and hmac.compare_digest(expected, token))
+
+
+def _seed_visible(rec: GameRecord) -> bool:
+    """A seed predicts every roll, so it is shown only when nobody else is playing: both seats
+    held by the caller, or the game over."""
+    return rec.status == "ended" or not any(_open(rec, f) for f in S.FACTIONS)
+
+
+def _require_insurgent_access(rec: GameRecord, token: str | None, what: str) -> None:
+    """The insurgent seat sees everything, so full/insurgent data needs that seat while it is open."""
+    if rec.status == "active" and not _holds(rec, "insurgent", token):
+        raise ToolError(f"the insurgent seat is open; {what} needs its seat_token. "
+                        f"Use view='government' (or faction='government') for the fogged picture.")
+
+
+def _default_view(rec: GameRecord, token: str | None) -> View:
+    """What a caller may see without asking: full unless the insurgent seat is someone else's."""
+    return "full" if _holds(rec, "insurgent", token) or rec.status == "ended" else "government"
+
+
+def _resolve_view(rec: GameRecord, view: View | None, token: str | None) -> View:
+    if view is None:
+        return _default_view(rec, token)
+    if view != "government":
+        _require_insurgent_access(rec, token, f"view='{view}'")
+    return view
+
+
+def _faction_view(faction: str) -> View:
+    return "government" if faction == "government" else "insurgent"
+
+
 def _state_view(rec: GameRecord, eng: Engine, view: View = "full") -> GameStateView:
     g = eng.global_state
     provinces = eng.gs.get_all_provinces()
@@ -166,18 +209,20 @@ def _state_view(rec: GameRecord, eng: Engine, view: View = "full") -> GameStateV
     forces = dict(gdump["faction_forces"])
     insurgent_resources: int | None = g.insurgent_resources
     if view == "government":
-        est = B._estimate_per_province(eng.gs)
+        est = eng.estimates
         provs: Any = [
             FoggedProvinceView(**{**p.model_dump(mode="json", exclude={"insurgent_forces"}),
-                                  "insurgent_estimated": est[p.id]})
+                                  "insurgent_estimated": est.get(p.id, 0)})
             for p in provinces
         ]
         forces["insurgent_total"] = None
+        forces["insurgent_estimated_by_government"] = sum(est.values())
         insurgent_resources = None
     else:
         provs = [ProvinceView(**p.model_dump(mode="json")) for p in provinces]
     return GameStateView(
-        game_id=rec.game_id, seed=rec.seed, version=rec.version, status=rec.status,  # type: ignore[arg-type]
+        game_id=rec.game_id, seed=rec.seed if (view == "full" and _seed_visible(rec)) else None,
+        version=rec.version, status=rec.status,  # type: ignore[arg-type]
         turn=g.turn, phase=eng.phase, active_faction=g.active_faction, view=view,
         global_state=GlobalStateView(
             turn=g.turn, active_faction=g.active_faction, government_resources=g.government_resources,
@@ -227,7 +272,7 @@ def _turn_result(rec: GameRecord, eng: Engine, faction: str, turn_played: int, r
         adjudication=res.adjudication or None, mutations=res.mutations, victory=_victory(res.victory),
         status=rec.status,  # type: ignore[arg-type]
         next=NextTurn(turn=eng.turn, active_faction=eng.active_faction, phase=eng.phase),
-        new_state=_state_view(rec, eng, "full"),
+        new_state=_state_view(rec, eng, _faction_view(faction)),
     )
 
 
@@ -240,10 +285,11 @@ def new_game(
     scenario: Annotated[Literal["mauritania_default"], Field(description="Only one scenario ships with the engine.")] = "mauritania_default",
     seats: Annotated[dict[str, SeatMode] | None, Field(description="Per faction: 'host' (you play it) or 'open' (another host plays it with the returned seat_token). Default: both 'host'.")] = None,
 ) -> GameCreated:
-    """Create a game and return its handle, the dice seed, seat tokens and the initial board.
+    """Create a game and return its handle, seat tokens and the initial board as you may see it.
 
     Both seats default to 'host': one model plays both sides, which is what the benchmark's
-    self-play uses. Mark a seat 'open' to hand it to another host over HTTP."""
+    self-play uses. Mark a seat 'open' to hand it to another host over HTTP; the seed is then
+    withheld (it predicts every roll) and the board is fogged for the seat you do not hold."""
     import random as _random
 
     seats = {"government": "host", "insurgent": "host", **(seats or {})}
@@ -257,32 +303,53 @@ def new_game(
     state, controller, dice = eng.snapshot()
     rec = _store().create(seed=seed, scenario=scenario, state=state, controller=controller,
                           dice_state=dice, seats=seats, seat_tokens=tokens)
-    return GameCreated(game_id=rec.game_id, seed=seed, seats=seats, seat_tokens=SeatTokens(**tokens),
-                       initial_state=_state_view(rec, eng))
+    # The creator holds every 'host' seat. Full view only when it holds both; the government view
+    # when the insurgent seat is someone else's; the insurgent view when only the government is open.
+    if not tokens:
+        view: View = "full"
+    elif "insurgent" in tokens:
+        view = "government"
+    else:
+        view = "insurgent"
+    return GameCreated(game_id=rec.game_id, seed=seed if not tokens else None, seats=seats,
+                       seat_tokens=SeatTokens(**tokens), initial_state=_state_view(rec, eng, view))
 
 
 @mcp.tool(title="List games", annotations=READ)
 def list_games(
     status: Annotated[Literal["active", "ended"] | None, Field(description="Filter by status.")] = None,
     limit: Annotated[int, Field(ge=1, le=200)] = 20,
+    seat_token: Annotated[str | None, Field(description="Shows games in which this token holds an open seat.")] = None,
 ) -> list[GameCard]:
-    """Games on this server, most recently touched first."""
+    """Games on this server, most recently touched first. Games with an open seat are listed
+    only to a caller presenting one of their seat tokens; seeds are shown only when visible."""
     out = []
     for r in _store().list(status, limit):
+        if any(_open(r, f) for f in S.FACTIONS) and not any(
+                _open(r, f) and _holds(r, f, seat_token) for f in S.FACTIONS):
+            continue
         g = r.state["global_state"]
-        out.append(GameCard(game_id=r.game_id, seed=r.seed, turn=g["turn"], phase=r.controller.get("phase", "?"),
+        out.append(GameCard(game_id=r.game_id, seed=r.seed if _seed_visible(r) else None, turn=g["turn"],
+                            phase=r.controller.get("phase", "?"),
                             active_faction=g["active_faction"], status=r.status,
                             winner=(r.winner or {}).get("winner"), created_at=r.created_at, updated_at=r.updated_at))
     return out
 
 
 @mcp.tool(title="End a game", annotations=WRITE_IDEMPOTENT)
-def end_game(game_id: Annotated[str, Field(description="Handle from new_game.")]) -> GameSummary:
+def end_game(
+    game_id: Annotated[str, Field(description="Handle from new_game.")],
+    seat_token: Annotated[str | None, Field(description="Required when any seat is open: either player's token ends the game.")] = None,
+) -> GameSummary:
     """End a game now and return the engine's session summary.
 
     Idempotent: ending an ended game returns the same summary. Ended games stay readable
-    and after_action_review becomes available."""
+    and after_action_review becomes available. With an open seat, one of the open seats'
+    tokens is required so a spectator cannot end someone else's game."""
     rec = _load(game_id)
+    open_seats = [f for f in S.FACTIONS if _open(rec, f)]
+    if rec.status == "active" and open_seats and not any(_holds(rec, f, seat_token) for f in open_seats):
+        raise ToolError(f"the {' and '.join(open_seats)} seat is open; present a seat_token to end the game")
     eng = Engine.load(rec)
     summary = eng.end_summary()
     if rec.status == "active":
@@ -302,7 +369,7 @@ def replay(game_id: Annotated[str, Field(description="Handle from new_game.")]) 
     with `divergence_at_turn` would mean an unseeded random path in the engine."""
     rec = _load(game_id)
     r = Engine.replay(rec)
-    return Replay(game_id=rec.game_id, seed=rec.seed,
+    return Replay(game_id=rec.game_id, seed=rec.seed if _seed_visible(rec) else None,
                   actions=sum(1 for e in rec.turn_log if e.get("kind") in ("action", "pass", "ic_request")),
                   reproduced=r["reproduced"], divergence_at_turn=r["divergence_at_turn"],
                   final_turn=rec.state["global_state"]["turn"])
@@ -314,26 +381,39 @@ def replay(game_id: Annotated[str, Field(description="Handle from new_game.")]) 
 @mcp.tool(title="Read the board", annotations=READ)
 def get_state(
     game_id: Annotated[str, Field(description="Handle from new_game.")],
-    view: Annotated[View, Field(description="'government' applies the fog rule (estimate instead of true insurgent numbers); 'insurgent' and 'full' see everything.")] = "full",
+    view: Annotated[View | None, Field(description="'government' applies the fog rule (estimate instead of true insurgent numbers); 'insurgent' and 'full' see everything and need the insurgent seat while it is open. Default: the most you may see.")] = None,
+    seat_token: Annotated[str | None, Field(description="Insurgent seat token, when that seat is open.")] = None,
 ) -> GameStateView:
-    """Turn, phase, active faction, global state and all 13 provinces."""
+    """Turn, phase, active faction, global state and all 13 provinces, as the caller may see them."""
     rec = _load(game_id)
-    return _state_view(rec, Engine.load(rec), view)
+    v = _resolve_view(rec, view, seat_token)
+    return _state_view(rec, Engine.load(rec), v)
 
 
 @mcp.tool(title="Read one province", annotations=READ)
 def get_province(
     game_id: Annotated[str, Field(description="Handle from new_game.")],
     province_id: Annotated[str, Field(description="One of the 13 province ids, e.g. 'hodh_ech_chargui'.")],
+    view: Annotated[View | None, Field(description="As for get_state. Default: the most you may see.")] = None,
+    seat_token: Annotated[str | None, Field(description="Insurgent seat token, when that seat is open.")] = None,
 ) -> ProvinceDetail:
-    """One province in full, with the engine's text encoding and how many legal actions each faction has from it."""
+    """One province with the engine's text encoding and how many legal actions each visible faction has from it."""
     rec = _load(game_id)
     eng = Engine.load(rec)
     if province_id not in E.ALL_PROVINCE_IDS:
         raise ToolError(f"unknown province {province_id!r}. Provinces: {', '.join(E.ALL_PROVINCE_IDS)}")
+    v = _resolve_view(rec, view, seat_token)
     p = eng.gs.get_province(province_id)
+    if v == "government":
+        est = eng.estimates.get(province_id, 0)
+        fogged = eng.fogged_store().get_province(province_id)
+        text = E.state_encoder.encode_province_details(fogged).replace(
+            f"Insurgent Forces: {est}", f"Insurgent Forces: ~{est} (estimate)")
+        return ProvinceDetail(view=v, province=FoggedProvinceView(**{**p.model_dump(mode="json", exclude={"insurgent_forces"}),
+                                                                      "insurgent_estimated": est}),
+                              text=text, legal_action_count={"government": len(eng.legal_actions("government", province_id))})
     counts = {f: len(eng.legal_actions(f, province_id)) for f in S.FACTIONS}
-    return ProvinceDetail(province=ProvinceView(**p.model_dump(mode="json")),
+    return ProvinceDetail(view=v, province=ProvinceView(**p.model_dump(mode="json")),
                           text=E.state_encoder.encode_province_details(p), legal_action_count=counts)
 
 
@@ -341,16 +421,18 @@ def get_province(
 def situation_brief(
     game_id: Annotated[str, Field(description="Handle from new_game.")],
     faction: Annotated[Faction, Field(description="Whose brief. The insurgent brief is the engine's own Red Team encoding.")],
+    seat_token: Annotated[str | None, Field(description="Insurgent seat token, needed for the insurgent brief while that seat is open.")] = None,
 ) -> Brief:
     """A Markdown strategic assessment for one seat: forces, control, the Mali corridor,
     sentiment, resources, scenario conditions, the other side's patterns and opportunities."""
     rec = _load(game_id)
     eng = Engine.load(rec)
     if faction == "insurgent":
+        _require_insurgent_access(rec, seat_token, "the insurgent brief")
         text, opps = B.insurgent_brief(eng.gs)
         doctrine, _ = eng.recommend_doctrine()
     else:
-        text, opps = B.government_brief(eng.gs)
+        text, opps = B.government_brief(eng)
         doctrine = None
     return Brief(faction=faction, turn=eng.turn, markdown=text, strategic_opportunities=opps,
                  recommended_doctrine=doctrine)
@@ -362,12 +444,15 @@ def list_legal_actions(
     faction: Annotated[Faction, Field(description="Whose actions to enumerate.")],
     province: Annotated[str | None, Field(description="Only actions originating here.")] = None,
     limit: Annotated[int, Field(ge=1, le=500, description="Cap on the returned list; the total is reported either way.")] = 120,
+    seat_token: Annotated[str | None, Field(description="Insurgent seat token, needed for faction='insurgent' while that seat is open (the list reveals where fighters are).")] = None,
 ) -> LegalActions:
     """Every action the rules engine accepts right now for a faction, at the minimum legal
     commitment (min_forces, no extra resources). Raise forces_committed above min_forces
     in submit_action if you want more weight; the validator still checks availability."""
     rec = _load(game_id)
     _require_active(rec)
+    if faction == "insurgent":
+        _require_insurgent_access(rec, seat_token, "listing insurgent actions")
     eng = Engine.load(rec)
     if province is not None and province not in E.ALL_PROVINCE_IDS:
         raise ToolError(f"unknown province {province!r}. Provinces: {', '.join(E.ALL_PROVINCE_IDS)}")
@@ -383,14 +468,19 @@ def preview_action(
     game_id: Annotated[str, Field(description="Handle from new_game.")],
     faction: Annotated[Faction, Field(description="Who would act.")],
     action: Action,
+    seat_token: Annotated[str | None, Field(description="Insurgent seat token, needed for insurgent previews while that seat is open.")] = None,
 ) -> ProbabilityBreakdown:
     """The probability breakdown for an action without rolling: base rate, every modifier
     with its explanation, the final success chance and the five outcome bands. Also
-    reports whether the action is currently legal."""
+    reports whether the action is currently legal. Government previews are computed
+    against the government's estimate of insurgent strength, not the true count; the
+    roll itself (submit_action) uses the truth."""
     rec = _load(game_id)
+    if faction == "insurgent":
+        _require_insurgent_access(rec, seat_token, "an insurgent preview")
     eng = Engine.load(rec)
     a = _parse_action(faction, action)
-    v = eng.validate(faction, a)
+    v = eng.validate(faction, a, fog=(faction == "government"))
     bd = eng.preview(faction, a)
     return ProbabilityBreakdown(action=action.model_dump(), base_probability=bd["base_probability"],
                                 modifier_total=bd["modifier_total"], modifier_breakdown=bd["modifier_breakdown"],
@@ -400,10 +490,15 @@ def preview_action(
 
 
 @mcp.tool(title="Recommend a doctrine", annotations=READ)
-def recommend_doctrine(game_id: Annotated[str, Field(description="Handle from new_game.")]) -> DoctrineAdvice:
+def recommend_doctrine(
+    game_id: Annotated[str, Field(description="Handle from new_game.")],
+    seat_token: Annotated[str | None, Field(description="Insurgent seat token, when that seat is open.")] = None,
+) -> DoctrineAdvice:
     """The engine Red Team's own doctrine selection heuristic (survival, consolidation,
-    exhaustion, opportunistic), offered as advice to the insurgent seat, not a constraint."""
+    exhaustion, opportunistic), offered as advice to the insurgent seat, not a constraint.
+    It reads the true insurgent strength, so it needs the insurgent seat while that is open."""
     rec = _load(game_id)
+    _require_insurgent_access(rec, seat_token, "doctrine advice")
     eng = Engine.load(rec)
     name, desc = eng.recommend_doctrine()
     preferred = {
@@ -618,21 +713,27 @@ def rules_map() -> dict:
 
 @mcp.resource("wargame://game/{game_id}", mime_type="application/json")
 def game_resource(game_id: str) -> dict:
-    """The full (unfogged) state view of one game."""
+    """The state view of one game: full when no seat is open or the game has ended, otherwise
+    the government (fogged) view, because a resource URI cannot carry a seat token."""
     try:
         rec = _store().get(game_id)
     except UnknownGame:
         raise ResourceNotFoundError(f"wargame://game/{game_id}")
-    return _state_view(rec, Engine.load(rec)).model_dump(mode="json")
+    return _state_view(rec, Engine.load(rec), _default_view(rec, None)).model_dump(mode="json")
 
 
 @mcp.resource("wargame://game/{game_id}/log", mime_type="application/json")
 def game_log(game_id: str) -> dict:
-    """The turn log with rationales: every action, pass and IC request, with adjudication and mutations."""
+    """The turn log with rationales: every action, pass and IC request, with adjudication and
+    mutations. Both sides' rationales and rolls are secrets while a seat is open, so the log is
+    served only when no seat is open or the game has ended."""
     try:
         rec = _store().get(game_id)
     except UnknownGame:
         raise ResourceNotFoundError(f"wargame://game/{game_id}/log")
+    if rec.status == "active" and any(_open(rec, f) for f in S.FACTIONS):
+        raise ResourceNotFoundError(f"wargame://game/{game_id}/log is withheld while a seat is open; "
+                                    "it becomes readable when the game ends")
     return {"game_id": rec.game_id, "seed": rec.seed, "status": rec.status, "version": rec.version, "log": rec.turn_log}
 
 

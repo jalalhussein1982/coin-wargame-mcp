@@ -30,24 +30,18 @@ def _opportunities_from(text: str) -> list[str]:
     return out
 
 
-def _estimate_per_province(gs: E.GameStateStore) -> dict[str, int]:
-    """Apportion the government's total estimate across provinces by true share.
-
-    The host sees shares of an estimate, not counts. This matches the engine's
-    ``insurgent_estimated_by_government`` rule and is the only insurgent number the
-    government seat ever gets."""
-    provinces = gs.get_all_provinces()
-    total_true = sum(p.insurgent_forces for p in provinces)
-    estimate = gs.get_global_state().faction_forces.insurgent_estimated_by_government
-    if total_true == 0:
-        return {p.id: 0 for p in provinces}
-    return {p.id: round(estimate * p.insurgent_forces / total_true) for p in provinces}
+def _estimate_per_province(eng) -> dict[str, int]:
+    """The server's lagged, noisy per-province estimate (``Engine.estimates``). This is the only
+    insurgent number the government seat ever gets; it is never derived from the true share."""
+    return eng.estimates
 
 
-def government_brief(gs: E.GameStateStore) -> tuple[str, list[str]]:
+def government_brief(eng) -> tuple[str, list[str]]:
+    gs = eng.gs
     g = gs.get_global_state()
     provinces = gs.get_all_provinces()
-    est = _estimate_per_province(gs)
+    est = _estimate_per_province(eng)
+    est_total = sum(est.values())
     f = g.faction_forces
     gov_deployed = sum(p.government_forces for p in provinces)
 
@@ -61,8 +55,8 @@ def government_brief(gs: E.GameStateStore) -> tuple[str, list[str]]:
         "## FORCE SUMMARY\n"
         f"Government:\n  - Total Forces: {f.government_total}\n  - Deployed: {gov_deployed}\n"
         f"  - Reserves: {f.government_reserves}\n\n"
-        f"Insurgent (intelligence estimate): ~{f.insurgent_estimated_by_government}\n"
-        f"Estimated Ratio: {gov_deployed / max(f.insurgent_estimated_by_government, 1):.1f}:1 government"
+        f"Insurgent (intelligence estimate): ~{est_total}\n"
+        f"Estimated Ratio: {gov_deployed / max(est_total, 1):.1f}:1 government"
     )
 
     def row(p) -> str:
