@@ -238,6 +238,9 @@ def _commit(rec: GameRecord, eng: Engine, *, entries: list[dict] | None = None) 
     state, controller, dice = eng.snapshot()
     rec.state, rec.controller, rec.dice_state = state, controller, dice
     if entries:
+        digest = eng.state_hash()
+        for e in entries:
+            e.setdefault("state_hash", digest)
         rec.turn_log = rec.turn_log + entries
     if eng.controller["session_state"] == "ended":
         rec.status = "ended"
@@ -558,13 +561,20 @@ def request_international_community(
     target: Annotated[str | None, Field(description="Country or actor the request concerns, if any.")] = None,
     seat_token: Annotated[str | None, Field(description="Required when the government seat is 'open'.")] = None,
 ) -> ICResponseView:
-    """Government only. The engine's IC oracle, rule-based path, seeded from the game dice
-    so a replay returns the same decision. Does not consume the action phase."""
+    """Government only, during the government action phase; does not consume the phase.
+
+    Narrative only: the engine's IC oracle (rule-based path, seeded from the game dice so a
+    replay returns the same decision) answers with a decision, conditions and a timeline, but
+    the vendored engine applies no mutation for it, so it has no effect on the board. Use it to
+    frame a rationale, not to change the odds."""
     rec = _load(game_id)
     _require_active(rec)
     S.check(rec, "government", seat_token)
     eng = Engine.load(rec)
-    ic = eng.ic_request(request_type, justification, target)
+    try:
+        ic = eng.ic_request(request_type, justification, target)
+    except (WrongTurn, GameOver) as e:
+        raise ToolError(str(e))
     entry = {"kind": "ic_request", "turn": eng.turn, "faction": "government",
              "ic": {**ic, "justification": justification}}
     rec = _commit(rec, eng, entries=[entry])
@@ -820,46 +830,89 @@ def after_action_debrief(game_id: Annotated[str, Field(description="Handle of an
 # ── entry point ──────────────────────────────────────────────────────────────────────
 
 
+def loopback_security():
+    """Host/Origin allow-list for --no-auth: loopback only, any port."""
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=["127.0.0.1", "127.0.0.1:*", "localhost", "localhost:*"],
+        allowed_origins=["http://127.0.0.1", "http://127.0.0.1:*", "http://localhost", "http://localhost:*"],
+    )
+
+
+def http_settings(*, host: str, port: int, no_auth: bool, public_url: str | None, env: dict):
+    """Resolve the HTTP configuration or exit with a message. Returns (server, bind_host, security).
+
+    --no-auth always binds loopback. With auth, OAUTH_ISSUER_URL plus OAUTH_SHARED_SECRET and/or
+    OAUTH_STATIC_TOKENS are required; a non-loopback bind needs --public-url (or OAUTH_RESOURCE_URL)
+    so the resource URL, the Host allow-list and the Origin allow-list come from the name clients
+    use rather than from the bind address."""
+    from urllib.parse import urlparse
+
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    if no_auth:
+        return mcp, "127.0.0.1", loopback_security()
+    issuer = env.get("OAUTH_ISSUER_URL")
+    if not issuer:
+        print("HTTP mode needs OAUTH_ISSUER_URL (with OAUTH_SHARED_SECRET and/or OAUTH_STATIC_TOKENS), "
+              "or --no-auth for loopback.", file=sys.stderr)
+        raise SystemExit(2)
+    if not env.get("OAUTH_SHARED_SECRET") and not env.get("OAUTH_STATIC_TOKENS"):
+        print("OAUTH_ISSUER_URL is set but neither OAUTH_SHARED_SECRET nor OAUTH_STATIC_TOKENS is; "
+              "every request would be rejected. Set one, or use --no-auth.", file=sys.stderr)
+        raise SystemExit(2)
+    loopback = host in ("127.0.0.1", "localhost", "::1")
+    public_url = public_url or env.get("OAUTH_RESOURCE_URL")
+    if not public_url:
+        if not loopback:
+            print(f"--host {host} is not loopback; pass --public-url https://name.example/mcp (or set "
+                  "OAUTH_RESOURCE_URL) so the resource URL and Host allow-list match what clients send.",
+                  file=sys.stderr)
+            raise SystemExit(2)
+        public_url = f"http://{host}:{port}/mcp"
+    parsed = urlparse(public_url)
+    if not parsed.scheme or not parsed.hostname:
+        print(f"--public-url must be an absolute URL, got {public_url!r}", file=sys.stderr)
+        raise SystemExit(2)
+    from .auth import SCOPE, JwtVerifier
+
+    try:
+        verifier = JwtVerifier.from_env(issuer, public_url, env=env)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        raise SystemExit(2)
+    server = build_server(token_verifier=verifier, auth=AuthSettingsFactory(issuer, public_url, [SCOPE]))
+    _reregister(server)
+    names = [parsed.hostname] + ([host] if not loopback and host != parsed.hostname and host != "0.0.0.0" else [])
+    extra = [h for h in env.get("ALLOWED_HOSTS", "").split(",") if h]
+    allowed_hosts = []
+    for n in names + extra:
+        allowed_hosts += [n, f"{n}:*"] if not n.endswith(":*") else [n]
+    allowed_origins = [f"{scheme}://{n}" for n in names + extra for scheme in ("https", "http")]
+    allowed_origins += [f"{scheme}://{n}:*" for n in names + extra for scheme in ("https", "http")]
+    security = TransportSecuritySettings(enable_dns_rebinding_protection=True, allowed_hosts=allowed_hosts,
+                                         allowed_origins=allowed_origins)
+    return server, host, security
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="coin-wargame-mcp", description=__doc__.split("\n\n")[0])
     ap.add_argument("--stdio", action="store_true", help="stdio transport (default)")
     ap.add_argument("--http", action="store_true", help="Streamable HTTP transport")
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--host", default="127.0.0.1", help="bind address (HTTP)")
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--public-url", default=None,
+                    help="URL clients use, e.g. https://wargame.example.com/mcp; required with auth when --host is not loopback")
     ap.add_argument("--no-auth", action="store_true",
                     help="HTTP without bearer tokens; binds loopback only with Host/Origin checks")
     args = ap.parse_args(argv)
     if not args.http:
         mcp.run()
         return
-    from mcp.server.transport_security import TransportSecuritySettings
-
-    issuer = os.environ.get("OAUTH_ISSUER_URL")
-    if args.no_auth or not issuer:
-        if not args.no_auth:
-            print("HTTP mode needs OAUTH_ISSUER_URL (and OAUTH_SHARED_SECRET or OAUTH_STATIC_TOKENS), "
-                  "or --no-auth for loopback.", file=sys.stderr)
-            sys.exit(2)
-        host = "127.0.0.1"
-        security = TransportSecuritySettings(
-            enable_dns_rebinding_protection=True,
-            allowed_hosts=["127.0.0.1", "127.0.0.1:*", "localhost", "localhost:*"],
-            allowed_origins=["http://127.0.0.1", "http://127.0.0.1:*", "http://localhost", "http://localhost:*"],
-        )
-        server = mcp
-    else:
-        from .auth import SCOPE, JwtVerifier
-
-        host = args.host
-        resource = os.environ.get("OAUTH_RESOURCE_URL", f"http://{host}:{args.port}/mcp")
-        server = build_server(
-            token_verifier=JwtVerifier.from_env(issuer, resource),
-            auth=AuthSettingsFactory(issuer, resource, [SCOPE]),
-        )
-        _reregister(server)
-        allowed = os.environ.get("ALLOWED_HOSTS", f"{host}:*,{host}").split(",")
-        security = TransportSecuritySettings(enable_dns_rebinding_protection=True, allowed_hosts=allowed,
-                                             allowed_origins=[f"http://{h}" for h in allowed] + [f"https://{h}" for h in allowed])
+    server, host, security = http_settings(host=args.host, port=args.port, no_auth=args.no_auth,
+                                           public_url=args.public_url, env=dict(os.environ))
     server.run(transport="streamable-http", host=host, port=args.port, transport_security=security)
 
 
@@ -867,7 +920,7 @@ def AuthSettingsFactory(issuer: str, resource: str, scopes: list[str]):
     from mcp.server.auth.settings import AuthSettings
 
     return AuthSettings(issuer_url=AnyHttpUrl(issuer), resource_server_url=AnyHttpUrl(resource),
-                        required_scopes=scopes, validate_token_resource=False)
+                        required_scopes=scopes, validate_token_resource=True)
 
 
 def _reregister(server: MCPServer) -> None:

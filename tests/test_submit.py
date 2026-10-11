@@ -90,3 +90,15 @@ async def test_full_turn_both_seats_and_unknown_inputs(client: Client, game: str
     r = await client.call_tool("submit_action", {"game_id": game, "faction": "government",
                                                   "action": {"action_type": "patrol", "source_province": "atlantis"}})
     assert r.is_error and "atlantis" in r.content[0].text
+
+
+@pytest.mark.anyio
+async def test_ic_request_only_in_the_government_action_phase(client: Client, game: str):
+    args = {"game_id": game, "request_type": "humanitarian", "justification": "displacement"}
+    ok = (await client.call_tool("request_international_community", args)).structured_content
+    assert ok["decision"] in {"approved", "conditional", "delayed", "denied"}
+    await client.call_tool("submit_action", {"game_id": game, "faction": "government", "action": PATROL})
+    r = await client.call_tool("request_international_community", args)
+    assert r.is_error and "insurgent's turn" in r.content[0].text
+    tools = {t.name: t for t in (await client.list_tools()).tools}
+    assert "no effect on the board" in tools["request_international_community"].description

@@ -48,3 +48,20 @@ async def test_open_government_seat_guards_ic_requests_too(client: Client):
     assert not r.is_error
     assert r.structured_content["decision"] in {"approved", "conditional", "delayed", "denied"}
     assert r.structured_content["version"] == 2
+
+
+@pytest.mark.anyio
+async def test_end_game_needs_a_token_when_a_seat_is_open(client: Client):
+    g = (await client.call_tool("new_game", {"seed": 7, "seats": {"insurgent": "open"}})).structured_content
+    gid, tok = g["game_id"], g["seat_tokens"]["insurgent"]
+    r = await client.call_tool("end_game", {"game_id": gid})
+    assert r.is_error and "insurgent seat is open" in r.content[0].text
+    r = await client.call_tool("end_game", {"game_id": gid, "seat_token": "0" * 32})
+    assert r.is_error
+    assert (await client.call_tool("get_state", {"game_id": gid})).structured_content["status"] == "active"
+    r = (await client.call_tool("end_game", {"game_id": gid, "seat_token": tok})).structured_content
+    assert r["status"] == "ended"
+    # Once ended, the log and the seed are readable by anyone; end_game stays idempotent without a token.
+    assert (await client.call_tool("end_game", {"game_id": gid})).structured_content["status"] == "ended"
+    assert (await client.call_tool("replay", {"game_id": gid})).structured_content["seed"] == 7
+    await client.read_resource(f"wargame://game/{gid}/log")

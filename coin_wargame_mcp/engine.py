@@ -18,6 +18,8 @@ paths are wrapped because they are not seeded upstream:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import random
 import threading
 from dataclasses import dataclass
@@ -49,6 +51,10 @@ def _estimate_noise(seed: int, turn: int, province_id: str) -> float:
     r = random.Random(f"{seed}:{turn}:{province_id}").random()
     lo, hi = ESTIMATE_NOISE
     return lo + (hi - lo) * r
+
+
+# The IC oracle's fallback reads the process-global `random`; one caller at a time.
+_GLOBAL_RANDOM_LOCK = threading.Lock()
 
 
 class IllegalAction(ValueError):
@@ -140,6 +146,13 @@ class Engine:
 
     def snapshot(self) -> tuple[dict, dict, list]:
         return self.gs.serialize(), dict(self.controller), dice_state_to_json(self.dice._rng.getstate())
+
+    def state_hash(self) -> str:
+        """SHA-256 over state, controller and dice state; recorded on every log entry so a replay
+        can name the first entry after which the record disagrees."""
+        state, controller, dice = self.snapshot()
+        blob = json.dumps([state, controller, dice], sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(blob.encode()).hexdigest()
 
     # ── read side ──────────────────────────────────────────────────────────────
 
@@ -362,8 +375,8 @@ class Engine:
         seeded from the game dice, so a replay reproduces the same decision."""
         if request_type not in IC_REQUEST_TYPES:
             raise ValueError(f"unknown request_type {request_type!r}; one of {', '.join(IC_REQUEST_TYPES)}")
-        if self.controller["session_state"] != "active":
-            raise GameOver("game is over")
+        # Government action phase only (same guard as acting), but the phase is not consumed.
+        self._require_turn("government")
         oracle = E.ICOracle(api_key=None)
         oracle._model = None
         req = E.ICRequest(request_type=request_type, requesting_faction="government",
@@ -371,12 +384,14 @@ class Engine:
         # `_fallback_evaluate` does `import random` inside the method and calls the module-level
         # `random.random()`. Seed that global generator from the game dice for the duration of the
         # call and restore its prior state afterwards, so nothing else in the process is affected.
-        saved = random.getstate()
-        random.seed(self.dice.roll(10**6))
-        try:
-            resp = oracle._fallback_evaluate(req, self.gs)
-        finally:
-            random.setstate(saved)
+        draw = self.dice.roll(10**6)
+        with _GLOBAL_RANDOM_LOCK:
+            saved = random.getstate()
+            random.seed(draw)
+            try:
+                resp = oracle._fallback_evaluate(req, self.gs)
+            finally:
+                random.setstate(saved)
         out = {
             "decision": resp.decision, "conditions": list(resp.conditions), "magnitude": resp.magnitude,
             "timeline": resp.timeline, "backlash_effects": list(resp.backlash_effects),
@@ -388,7 +403,11 @@ class Engine:
 
     @classmethod
     def replay(cls, rec: GameRecord) -> dict:
-        """Re-run ``rec.turn_log`` from the initial state with ``rec.seed`` and compare."""
+        """Re-run ``rec.turn_log`` from the initial state with ``rec.seed`` and compare.
+
+        After every entry the re-run's ``state_hash`` is checked against the hash the server
+        recorded when the entry was written; the first disagreement names ``divergence_at_turn``.
+        At the end, state, controller and dice state must all equal the stored row."""
         eng = cls.new(rec.seed, rec.scenario)
         divergence: int | None = None
         for entry in rec.turn_log:
@@ -409,11 +428,21 @@ class Engine:
                     if got["decision"] != ic["decision"]:
                         divergence = entry["turn"]
                         break
+                elif kind == "end":
+                    eng.controller["session_state"] = "ended"
+                    continue
+                else:
+                    continue
             except (IllegalAction, WrongTurn, GameOver):
                 divergence = entry.get("turn")
                 break
-        final_state, _, _ = eng.snapshot()
-        reproduced = divergence is None and final_state == rec.state
+            recorded = entry.get("state_hash")
+            if recorded is not None and recorded != eng.state_hash():
+                divergence = entry.get("turn")
+                break
+        final_state, final_controller, final_dice = eng.snapshot()
+        same = (final_state == rec.state and final_controller == rec.controller and final_dice == rec.dice_state)
+        reproduced = divergence is None and same
         if not reproduced and divergence is None:
             divergence = rec.state.get("global_state", {}).get("turn")
         return {"reproduced": reproduced, "divergence_at_turn": divergence, "final_state": final_state}
