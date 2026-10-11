@@ -130,11 +130,19 @@ class AnthropicProvider:
 
     Each ``choose`` sends the system prompt (the MCP prompt text), the conversation and
     the MCP tool list converted to Anthropic tool definitions, and returns the first
-    ``tool_use`` block or the final text."""
+    ``tool_use`` block or the final text. The runner builds a fresh message list per turn
+    (the opener names the game, faction and turn), so the model's memory is the board the
+    tools return, not the transcript of earlier turns.
+
+    ``stop_reason`` handling: ``max_tokens`` means the reply (and any tool_use in it) was
+    truncated, so nothing is executed and the request is retried with a larger budget;
+    ``pause_turn`` is resumed by asking again; ``refusal`` ends the turn without acting;
+    ``end_turn``/``stop_sequence`` return the text as ``Final``."""
 
     model: str = DEFAULT_ANTHROPIC_MODEL
     system: str = ""
-    max_tokens: int = 1024
+    max_tokens: int = 4096
+    max_retries: int = 2
     name: str = ""
     usage: Usage = field(default_factory=Usage)
     _client: Any = None
@@ -160,19 +168,38 @@ class AnthropicProvider:
 
     def choose(self, messages: list[dict], tools: list[dict]) -> ToolCall | Final:
         client = self._ensure_client()
-        resp = client.messages.create(
-            model=self.model, max_tokens=self.max_tokens, system=self.system or "You play a wargame through tools.",
-            messages=[_strip_private(m) for m in messages], tools=self.to_anthropic_tools(tools),
-            tool_choice={"type": "auto", "disable_parallel_tool_use": True},
-        )
-        self.usage.add(resp.usage.input_tokens, resp.usage.output_tokens)
-        for block in resp.content:
-            if block.type == "tool_use":
-                messages.append({"role": "assistant", "content": [b.model_dump() for b in resp.content]})
-                return ToolCall(block.name, dict(block.input), id=block.id)
-        text = "".join(getattr(b, "text", "") for b in resp.content)
-        messages.append({"role": "assistant", "content": text or "(no text)"})
-        return Final(text)
+        budget = self.max_tokens
+        attempts = 0
+        while True:
+            resp = client.messages.create(
+                model=self.model, max_tokens=budget, system=self.system or "You play a wargame through tools.",
+                messages=[_strip_private(m) for m in messages], tools=self.to_anthropic_tools(tools),
+                tool_choice={"type": "auto", "disable_parallel_tool_use": True},
+            )
+            self.usage.add(resp.usage.input_tokens, resp.usage.output_tokens)
+            stop = getattr(resp, "stop_reason", None)
+            if stop == "max_tokens":
+                attempts += 1
+                if attempts > self.max_retries:
+                    raise RuntimeError(f"reply truncated at {budget} tokens after {attempts} attempts; nothing executed")
+                budget *= 2
+                continue
+            if stop == "pause_turn":
+                attempts += 1
+                if attempts > self.max_retries:
+                    return Final("(pause_turn: no decision)")
+                continue
+            content = [b.model_dump(exclude_none=True) for b in resp.content]
+            text = "".join(b.get("text", "") for b in content if b.get("type") == "text")
+            if stop == "refusal":
+                messages.append({"role": "assistant", "content": text or "(refusal)"})
+                return Final(f"refusal: {text}".strip())
+            for block in resp.content:
+                if getattr(block, "type", None) == "tool_use":
+                    messages.append({"role": "assistant", "content": content})
+                    return ToolCall(block.name, dict(block.input), id=block.id)
+            messages.append({"role": "assistant", "content": text or "(no text)"})
+            return Final(text)
 
 
 def _strip_private(m: dict) -> dict:

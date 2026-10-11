@@ -163,7 +163,8 @@ async def run(server: Any, seeds: list[int], red_spec: str, gov_spec: str, model
 
 
 def stdio_server() -> StdioServerParameters:
-    env = {k: v for k, v in os.environ.items() if k != "GEMINI_API_KEY"}
+    # The server needs no model key; never hand it ours.
+    env = {k: v for k, v in os.environ.items() if k not in ("GEMINI_API_KEY", "ANTHROPIC_API_KEY")}
     env.setdefault("COIN_WARGAME_DB", str(RESULTS_DIR / "bench-games.db"))
     return StdioServerParameters(command=sys.executable, args=["-m", "coin_wargame_mcp.server"], env=env,
                                  cwd=str(Path(__file__).resolve().parent.parent))

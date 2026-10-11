@@ -43,3 +43,62 @@ def test_anthropic_provider_is_importable_without_a_key(monkeypatch):
     assert tools == [{"name": "x", "description": "d", "input_schema": {"type": "object", "properties": {}}}]
     with pytest.raises(ValueError):
         providers.make_provider("gemini")
+
+
+class _Block:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+    def model_dump(self, exclude_none=False):
+        return {k: v for k, v in self.__dict__.items() if not (exclude_none and v is None)}
+
+
+class _Resp:
+    def __init__(self, content, stop_reason):
+        self.content, self.stop_reason = content, stop_reason
+        self.usage = _Block(input_tokens=10, output_tokens=5)
+
+
+class _FakeMessages:
+    def __init__(self, responses):
+        self.responses, self.calls = list(responses), []
+
+    def create(self, **kw):
+        self.calls.append(kw)
+        return self.responses.pop(0)
+
+
+def test_anthropic_provider_handles_stop_reasons(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    p = providers.AnthropicProvider(system="s")
+    truncated = _Resp([_Block(type="tool_use", id="t1", name="submit_action", input={"a": 1}, cache_control=None)], "max_tokens")
+    complete = _Resp([_Block(type="text", text="thinking", cache_control=None),
+                      _Block(type="tool_use", id="t2", name="get_state", input={"game_id": "g"}, cache_control=None)], "tool_use")
+    p._client = _Block(messages=_FakeMessages([truncated, complete]))
+    messages = [{"role": "user", "content": "{}"}]
+    choice = p.choose(messages, [])
+    # The truncated tool_use was not executed; the call was retried with a larger budget.
+    assert isinstance(choice, providers.ToolCall) and choice.name == "get_state" and choice.id == "t2"
+    calls = p._client.messages.calls
+    assert calls[0]["max_tokens"] == 4096 and calls[1]["max_tokens"] > calls[0]["max_tokens"]
+    assert messages[-1]["role"] == "assistant"
+    assert all("cache_control" not in b for b in messages[-1]["content"]), "None fields are dropped"
+    assert p.usage.input_tokens == 20
+
+    p._client = _Block(messages=_FakeMessages([_Resp([_Block(type="text", text="I decline.", cache_control=None)], "refusal")]))
+    choice = p.choose([{"role": "user", "content": "{}"}], [])
+    assert isinstance(choice, providers.Final) and "refusal" in choice.text
+
+    p._client = _Block(messages=_FakeMessages([_Resp([_Block(type="text", text="", cache_control=None)], "pause_turn"),
+                                               _Resp([_Block(type="text", text="done", cache_control=None)], "end_turn")]))
+    choice = p.choose([{"role": "user", "content": "{}"}], [])
+    assert isinstance(choice, providers.Final) and choice.text == "done"
+
+
+def test_stdio_server_env_strips_model_keys(monkeypatch):
+    from bench.__main__ import stdio_server
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "a")
+    monkeypatch.setenv("GEMINI_API_KEY", "g")
+    env = stdio_server().env
+    assert "ANTHROPIC_API_KEY" not in env and "GEMINI_API_KEY" not in env
