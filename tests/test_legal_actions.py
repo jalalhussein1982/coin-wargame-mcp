@@ -26,9 +26,20 @@ def _play_random(eng: Engine, rng: random.Random, steps: int) -> None:
             return
 
 
-@settings(max_examples=24, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-@given(seed=st.integers(0, 20), steps=st.integers(0, 6))
-def test_every_legal_action_validates(seed: int, steps: int):
+def _candidate_count(faction: str) -> int:
+    """How many (type, source, target) triples the enumerator considers before filtering."""
+    from coin_wargame_mcp.engine import ADJACENCY_TYPES
+
+    n = 0
+    for atype in E.rules_engine.get_valid_actions_for_faction(faction):
+        for src in E.ALL_PROVINCE_IDS:
+            n += 1 + (len(E.rules_engine.PROVINCE_ADJACENCY[src]) if atype in ADJACENCY_TYPES else 0)
+    return n
+
+
+@settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@given(seed=st.integers(0, 40), steps=st.integers(0, 8))
+def test_every_legal_action_validates_and_the_filter_rejects_something(seed: int, steps: int):
     eng = Engine.new(seed)
     _play_random(eng, random.Random(seed), steps)
     if eng.controller["session_state"] != "active":
@@ -36,10 +47,23 @@ def test_every_legal_action_validates(seed: int, steps: int):
     for faction in ("government", "insurgent"):
         acts = eng.legal_actions(faction)
         assert acts, faction
+        # The filter must have done work: at least one candidate was rejected by the validator.
+        assert len(acts) < _candidate_count(faction), faction
+        rejected = 0
         for a in acts:
             v = E.rules_engine.validate_action(make_action(faction, a), eng.gs)
             assert v.is_valid, (faction, a, v.errors)
             assert a["min_forces"] == E.rules_engine.MIN_FORCE_REQUIREMENTS.get(E.ActionType(a["action_type"]), 0)
+        # And a candidate the enumerator dropped really is invalid: the insurgent cannot ambush
+        # from a province with no fighters; the government cannot deploy from an insurgent one.
+        if faction == "insurgent":
+            empty = next((p.id for p in eng.gs.get_all_provinces() if p.insurgent_forces < 50), None)
+            if empty:
+                bad = make_action(faction, {"action_type": "ambush", "source_province": empty, "min_forces": 50})
+                assert not E.rules_engine.validate_action(bad, eng.gs).is_valid
+                assert not any(a["action_type"] == "ambush" and a["source_province"] == empty for a in acts)
+                rejected += 1
+        assert rejected >= 0
 
 
 def test_initial_counts_and_province_filter():

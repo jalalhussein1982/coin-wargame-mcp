@@ -368,8 +368,10 @@ def end_game(
 @mcp.tool(title="Replay a game", annotations=READ)
 def replay(game_id: Annotated[str, Field(description="Handle from new_game.")]) -> Replay:
     """Re-run the game's turn log from the initial state with its seed and check that it
-    rebuilds the stored state exactly. `reproduced` is the reproducibility proof; a False
-    with `divergence_at_turn` would mean an unseeded random path in the engine."""
+    rebuilds the stored state, controller and dice state exactly. `reproduced` is the
+    reproducibility proof; `divergence_at_turn` is the first logged entry whose recorded
+    state hash the re-run fails to match. The re-run uses the rules and tables currently
+    vendored, so upgrading the engine can legitimately turn old games' `reproduced` False."""
     rec = _load(game_id)
     r = Engine.replay(rec)
     return Replay(game_id=rec.game_id, seed=rec.seed if _seed_visible(rec) else None,
@@ -528,7 +530,9 @@ def submit_action(
     and cascades, advance two phases, recalculate forces, check victory, persist.
 
     An illegal action is refused with the engine's errors and up to three legal
-    alternatives from the same province; the game is untouched."""
+    alternatives from the same province; the game is untouched. Victory is checked after
+    the two phase advances, so a win from an insurgent action on turn N is stamped turn N+1
+    (the engine's own convention)."""
     rec = _load(game_id)
     _require_active(rec)
     S.check(rec, faction, seat_token)

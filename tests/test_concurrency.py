@@ -57,3 +57,29 @@ async def test_stale_version_surfaces_as_the_documented_tool_error(monkeypatch):
         r = await c.call_tool("submit_action", {"game_id": game, "faction": "government", "action": PATROL})
         assert r.is_error
         assert "game advanced since you read it; call get_state" in r.content[0].text
+
+
+@pytest.mark.anyio
+async def test_two_clients_race_through_the_server_exactly_one_wins():
+    """Both clients fire the same government move at once; the server lets exactly one through."""
+    import anyio
+
+    from coin_wargame_mcp.server import mcp
+
+    async with Client(mcp, raise_exceptions=True) as a, Client(mcp, raise_exceptions=True) as b:
+        game = (await a.call_tool("new_game", {"seed": 13})).structured_content["game_id"]
+        results = {}
+
+        async def fire(name, client):
+            results[name] = await client.call_tool("submit_action", {"game_id": game, "faction": "government", "action": PATROL})
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(fire, "a", a)
+            tg.start_soon(fire, "b", b)
+        ok = [n for n, r in results.items() if not r.is_error]
+        failed = [n for n, r in results.items() if r.is_error]
+        assert len(ok) == 1 and len(failed) == 1, {n: r.content[0].text[:80] for n, r in results.items()}
+        text = results[failed[0]].content[0].text
+        assert "insurgent's turn" in text or "game advanced since you read it" in text
+        s = (await a.call_tool("get_state", {"game_id": game})).structured_content
+        assert s["version"] == 2 and s["phase"] == "insurgent_action"

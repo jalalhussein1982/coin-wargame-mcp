@@ -4,7 +4,7 @@
 
 ## What it does
 
-For each seed it calls `new_game(seed)`, then alternates seats. The active seat's provider is given the seat's play prompt (`play_red_team` or `play_government`, fetched from the server) as the system prompt, a short JSON opener naming the game, faction and turn, the tool list, and the results of its previous calls. It answers with one tool call at a time; the runner executes it over MCP and appends the result. A turn ends when `submit_action` or `pass_turn` succeeds for that faction. A seat that has not acted after twelve calls is passed for and the stall is counted. The game ends on victory or after `--max-turns` (default 30), then the runner calls `after_action_review`, `strategy_profile` and `replay`.
+For each seed it calls `new_game(seed)`, then alternates seats. The active seat's provider is given the seat's play prompt (`play_red_team` or `play_government`, fetched from the server) as the system prompt, a short JSON opener naming the game, faction and turn, the tool list, and the results of its previous calls in this turn. The message list is fresh every turn: the model's memory of the campaign is whatever the tools return (`situation_brief` carries the other side's recent patterns), not a transcript, which keeps context small and makes every turn start from the same place. It answers with one tool call at a time; the runner executes it over MCP and appends the result. A turn ends when `submit_action` or `pass_turn` succeeds for that faction. A seat that has not acted after twelve calls is passed for and the stall is counted. The game ends on victory or after `--max-turns` (default 30), then the runner calls `after_action_review`, `strategy_profile` and `replay`.
 
 One JSONL row per game describes the seat under test (`--side red` by default):
 
@@ -12,7 +12,7 @@ One JSONL row per game describes the seat under test (`--side red` by default):
 |---|---|
 | `seed`, `game_id`, `turns`, `winner`, `condition` | the game |
 | `model`, `side`, `opponent` | who played what |
-| `performance_score` | AAR score for a government row; `100 - AAR` for an insurgent row (the AAR is scored from the government seat) |
+| `performance_score` | AAR score for a government row; `100 - AAR` for an insurgent row (the AAR is scored from the government seat). Low resolution: the AAR rewards territory, legitimacy and force preservation generously, so a government that merely holds scores 95–100 and the insurgent side 0–5; wins, turns and illegal attempts carry more signal than this column |
 | `aar_government_score` | the AAR score unchanged |
 | `approach` | `strategy_profile.approach` for the government's play in this game |
 | `illegal_attempts` | `submit_action` calls the server refused as illegal (the tool-use error rate) |
@@ -25,7 +25,7 @@ One JSONL row per game describes the seat under test (`--side red` by default):
 ## Providers
 
 * `stub` — the rule-based baseline. Insurgent: `recommend_doctrine`, then `list_legal_actions`, then the first legal action among the doctrine's preferred types (AQ_NETWORK: propaganda, smuggling, ambush, assassination, taxation; ISIS_TERRITORIAL: seizure, taxation, shadow court, complex attack; TALIBAN_ADAPTIVE: intimidation, shadow court, hit-and-run, recruitment). Government: patrol, tribal engagement, service provision, checkpoint network, intelligence operation, media campaign. It passes when nothing is affordable. Three calls per turn, deterministic, no key needed.
-* `anthropic` — a Messages API tool-use loop (`claude-sonnet-5-5` by default, `--model` to change). Tools are the MCP tool list converted to `{name, description, input_schema}`; `tool_choice` is `auto` with parallel calls disabled so the runner executes one call at a time. Importable without a key; the first `choose` without `ANTHROPIC_API_KEY` raises.
+* `anthropic` — a Messages API tool-use loop (`claude-sonnet-5-5` by default, `--model` to change, `max_tokens` 4096). Tools are the MCP tool list converted to `{name, description, input_schema}`; `tool_choice` is `auto` with parallel calls disabled so the runner executes one call at a time. `stop_reason` is honoured: a `max_tokens` reply is discarded (a truncated `tool_use` is never executed) and retried with a doubled budget, `pause_turn` is resumed, `refusal` ends the turn without acting, `end_turn` returns the text. Importable without a key; the first `choose` without `ANTHROPIC_API_KEY` raises. The server subprocess the bench spawns never receives `ANTHROPIC_API_KEY` or `GEMINI_API_KEY`.
 
 ## Running
 
