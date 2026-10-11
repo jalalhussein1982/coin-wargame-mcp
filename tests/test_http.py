@@ -11,7 +11,6 @@ import pytest
 import uvicorn
 
 from mcp import Client
-from mcp.server.transport_security import TransportSecuritySettings
 
 INIT = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {"protocolVersion": "2026-07-28", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}}
@@ -45,20 +44,14 @@ class Served:
         self.thread.join(timeout=5)
 
 
-def loopback_security() -> TransportSecuritySettings:
-    return TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
-        allowed_hosts=["127.0.0.1", "127.0.0.1:*", "localhost", "localhost:*"],
-        allowed_origins=["http://127.0.0.1", "http://127.0.0.1:*", "http://localhost", "http://localhost:*"],
-    )
-
-
 @pytest.fixture
 def no_auth_url():
-    from coin_wargame_mcp.server import mcp
+    from coin_wargame_mcp.server import http_settings
 
     port = free_port()
-    app = mcp.streamable_http_app(transport_security=loopback_security())
+    server, host, security = http_settings(host="0.0.0.0", port=port, no_auth=True, public_url=None, env={})
+    assert host == "127.0.0.1"
+    app = server.streamable_http_app(transport_security=security)
     with Served(app, port):
         yield f"http://127.0.0.1:{port}/mcp"
 
